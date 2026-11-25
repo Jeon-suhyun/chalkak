@@ -38,7 +38,13 @@ def load_terms():
     """terms.csv + data/*.csv 를 하나의 용어 DB로 합침"""
     files = [f for f in ["terms.csv"] + sorted(glob.glob("data/*.csv")) if os.path.exists(f)]
     cols = ["term", "category", "easy", "source", "official", "plain", "basis"]
-    frames = [pd.read_csv(f, encoding="utf-8-sig", dtype=str).reindex(columns=cols) for f in files]
+    def read(f):  # 엑셀에서 'CSV(쉼표로 분리)'로 저장하면 cp949가 되므로 둘 다 읽음
+        try:
+            return pd.read_csv(f, encoding="utf-8-sig", dtype=str)
+        except UnicodeDecodeError:
+            return pd.read_csv(f, encoding="cp949", dtype=str)
+
+    frames = [read(f).reindex(columns=cols) for f in files]
     df = pd.concat(frames, ignore_index=True).fillna("")
     df["term"] = df["term"].astype(str).str.strip()
     df = df[(df["easy"] != "") | (df["official"] != "")]  # 설명이 하나도 없는 용어는 버림

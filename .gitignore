@@ -3,3 +3,4 @@
 .env
 __pycache__/
 *_backup.*
+_to_delete/
