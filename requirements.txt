@@ -1,0 +1,7 @@
+streamlit
+streamlit-image-coordinates
+pymupdf
+easyocr
+openai
+pandas
+pillow

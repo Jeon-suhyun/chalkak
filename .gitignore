@@ -1,0 +1,5 @@
+# API 키가 GitHub에 올라가지 않게 막음
+.streamlit/secrets.toml
+.env
+__pycache__/
+*_backup.*
