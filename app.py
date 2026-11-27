@@ -115,7 +115,12 @@ def read_pdf(file_bytes, page_no):
 
 # ---------------------------------------------------------------- 3. 용어 찾기
 def overlaps(a, b):
-    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+    """두 상자가 '절반 이상' 겹치면 같은 자리로 봄 ('우선변제권' 속 '변제' 같은 중복 방지).
+    살짝 닿기만 하는 위아래 줄 상자는 겹침으로 보지 않음 (글씨가 작고 줄 간격이 좁은 서류 대비)"""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return small > 0 and ix * iy / small > 0.5
 
 
 def add_hit(hits, term, box, row):
@@ -156,10 +161,56 @@ def find_terms_pdf(file_bytes, page_no, terms):
             continue
         for r in page.search_for(row["term"]):
             add_hit(hits, row["term"], (r.x0 * zoom - 2, r.y0 * zoom - 2, r.x1 * zoom + 2, r.y1 * zoom + 2), row)
+
+    # PDF에 '【 갑 구 】', '계약전 알릴 의무'처럼 글자 사이 공백이 사전과 다르면 정확 검색이 실패함
+    # → 아직 못 찾은 용어만 줄 단위로, 공백을 허용해서 다시 찾음
+    located = {h["term"] for h in hits}
+    missing = [r for r in terms.to_dict("records")
+               if r["term"] not in located and re.sub(r"\s+", "", r["term"]) in page_text]
+    if missing:
+        lines = []
+        for blk in page.get_text("dict")["blocks"]:
+            for line in blk.get("lines", []):
+                text = "".join(span["text"] for span in line["spans"])
+                x0, y0, x1, y1 = line["bbox"]
+                lines.append((text, (x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom)))
+        for h in find_terms(lines, pd.DataFrame(missing)):
+            add_hit(hits, h["term"], h["box"], h["row"])
     return hits
 
 
-def find_terms(lines, terms):
+def fuzzy_terms(lines, terms, hits):
+    """OCR이 한 글자를 잘못 읽은 경우(예: '계약갱신요구권'→'계약갱신요구궐')를 구제.
+    네 글자 이상 용어만, 정확히 한 글자만 다를 때, 그 글자 묶음이 다른 사전 용어가 아닐 때만 인정"""
+    known = {re.sub(r"\s+", "", t) for t in terms["term"]}
+    found = {h["term"] for h in hits}
+    line_info = []
+    for text, box in lines:
+        idx = [j for j, ch in enumerate(text) if not ch.isspace()]
+        compact = "".join(text[j] for j in idx)
+        line_info.append((text, box, idx, compact, bigrams(compact)))
+    for row in terms.to_dict("records"):
+        key = re.sub(r"\s+", "", row["term"])
+        if len(key) < 4 or row["term"] in found:
+            continue
+        kb = bigrams(key)
+        for text, (x0, y0, x1, y1), idx, compact, cb in line_info:
+            if len(kb & cb) < len(kb) - 2:  # 빠른 거르기: 두 글자 묶음이 거의 다 겹쳐야 후보
+                continue
+            for i in range(len(compact) - len(key) + 1):
+                w = compact[i:i + len(key)]
+                if w not in known and sum(a != b for a, b in zip(w, key)) == 1:
+                    tn = max(len(text), 1)
+                    s0, s1 = idx[i], idx[i + len(key) - 1] + 1
+                    add_hit(hits, row["term"], (x0 + (x1 - x0) * s0 / tn - 2, y0 - 2,
+                                                x0 + (x1 - x0) * s1 / tn + 2, y1 + 2), row)
+                    break
+            if any(h["term"] == row["term"] for h in hits):
+                break
+    return hits
+
+
+def find_terms(lines, terms, fuzzy=False):
     """사진(OCR) 글자 줄에서 용어를 찾아 [{term, box, row}] 반환.
     OCR은 띄어쓰기를 자주 틀리므로 글자 사이 공백을 허용해서 찾고,
     줄 안 위치는 글자 수 비율로 계산 (한글은 글자 폭이 거의 같아 잘 맞음)"""
@@ -180,6 +231,8 @@ def find_terms(lines, terms):
                     continue
                 add_hit(hits, row["term"], (x0 + (x1 - x0) * m.start() / tn - 2, y0 - 2,
                                             x0 + (x1 - x0) * m.end() / tn + 2, y1 + 2), row)
+    if fuzzy:  # 사진(OCR)일 때만
+        hits = fuzzy_terms(lines, terms, hits)
     return hits
 
 
@@ -274,13 +327,14 @@ def ai_find_more(doc_text, known, kind):
         return None
     prompt = (
         f"다음은 '{kind}' 관련 서류에서 읽은 글이다. 처음 이런 서류를 보는 20대가 이해하기 어려운 "
-        "법률·금융·의료 용어를 최대 8개 골라라. 글에 나온 표기 그대로 쓰고, "
+        f"법률·금융·의료 용어를 최대 {8 if len(doc_text) < 1500 else 15}개 골라라. 글에 나온 표기 그대로 쓰고, "
         f"이미 찾은 용어 {sorted(known)} 는 제외한다. 각 용어를 이 서류의 맥락에 맞게 중학생도 "
         '이해할 수 있도록 두 문장 이내로 설명하라. JSON으로만 답하라: {"terms":[{"term":"","easy":""}]}\n\n'
         + doc_text[:6000]
     )
     res = client.chat.completions.create(
         model=MODEL,
+        temperature=0,  # 같은 서류면 같은 결과가 나오도록
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )
@@ -406,7 +460,7 @@ def main():
     if not has_text and (len(lines) < 3 or quality < 0.4):
         st.warning("글자가 잘 안 읽혔어요. 밝은 곳에서 서류가 화면에 꽉 차게, 기울지 않게 다시 찍어 주세요.")
 
-    finder = (lambda df: find_terms_pdf(data, page_no, df)) if has_text else (lambda df: find_terms(lines, df))
+    finder = (lambda df: find_terms_pdf(data, page_no, df)) if has_text else (lambda df: find_terms(lines, df, fuzzy=True))
     doc_text = "\n".join(t for t, _ in lines)
     hits = finder(terms)
 
