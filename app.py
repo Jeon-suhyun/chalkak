@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -283,15 +284,19 @@ def retrieve(question, all_terms, cat, k=5):
     """질문과 관련된 용어를 사전에서 찾음.
     점수 = 질문에 용어가 그대로 있으면 큰 점수 + 글자 두 개씩 겹치는 정도 + 고른 서류 종류면 가산"""
     q = re.sub(r"\s+", "", question)
-    qb = bigrams(question)
+    rows = all_terms.to_dict("records")
+    # 사전 용어 이름에 너무 흔하게 나오는 두 글자(예: '보험', '건강')는 겹쳐도 관련 근거로 치지 않음
+    df = Counter(b for row in rows for b in bigrams(row["term"]))
+    common = {b for b, n in df.items() if n >= max(10, len(rows) * 0.01)}
+    qb = bigrams(question) - common
     scored = []
-    for row in all_terms.to_dict("records"):
+    for row in rows:
         key = re.sub(r"\s+", "", row["term"])
         score = 10.0 if key in q else 0.0
-        tb = bigrams(row["term"])
+        tb = bigrams(row["term"]) - common
         score += 3.0 * len(qb & tb) / max(len(tb), 1)
         score += 1.0 * len(qb & bigrams(row["easy"] or row["official"][:150])) / max(len(qb), 1)
-        if score >= 1.0:  # 아무 관련 없는 용어는 버림
+        if score >= 1.5:  # 아무 관련 없는 용어는 버림 (부분 일치면 용어 글자의 절반 이상이 겹쳐야 함)
             scored.append((score + (0.5 if row["category"] == cat else 0), row))
     scored.sort(key=lambda x: -x[0])
     if scored:  # 1등보다 한참 낮은 점수는 근거에서 뺌 (관련 없는 용어가 섞이지 않게)
@@ -373,15 +378,18 @@ def ai_answer(question, doc_text, refs, kind, facts=()):
         messages=[
             {"role": "system", "content": (
                 f"너는 '{kind}' 서류를 처음 보는 20대에게 용어와 조항을 쉽게 설명하는 도우미다. "
-                "아래 [용어 사전]과 [서류 내용]만 근거로 3~5문장으로 쉽게 답하라. "
-                "서류에 질문과 관련된 조항(계약 기간, 금액, 날짜 등)이 있으면 조항 번호와 함께 "
-                "원문 표현을 따옴표로 그대로 인용하고(기준일·숫자를 바꿔 말하지 마라), 그 내용을 직접 짚어서 "
-                "이 서류에 어떻게 적용되는지 말하라. [계산된 사실]이 있으면 그 값을 그대로 쓰고, "
-                "서류에 적힌 내용으로 판단할 수 있는 것은 '만약 ~라면' 같은 가정 없이 결론부터 말하라. "
-                "서류에 없는 정보(예: 업무가 단순노무인지)는 무엇을 더 확인해야 하는지 짧게 덧붙여라. "
-                "근거가 부족하면 모른다고 말하고 추측하지 마라. "
-                "사기 여부 판정이나 법률·의료 판단은 하지 말고, 필요하면 전문가 상담을 권하라.")},
-            {"role": "user", "content": f"[용어 사전]\n{ctx}\n\n[계산된 사실]\n{chr(10).join(facts) or '(없음)'}\n\n[서류 내용]\n{doc_text[:4000]}\n\n[질문]\n{question}"},
+                "근거는 [서류 내용], [계산된 사실], [용어 사전]뿐이다. 아래 순서대로 생각하고 3~5문장 존댓말(~요, ~습니다)로 답하라.\n"
+                "1) 먼저 [서류 내용]에서 질문과 관련된 조항(계약 기간, 금액, 수습, 날짜 등)을 모두 찾는다. "
+                "찾았으면 조항 번호와 원문 표현을 따옴표로 그대로 인용한다(숫자·기준일을 바꾸지 마라). "
+                "정말 하나도 없을 때만 '이 서류에는 ~에 대한 조항이 없습니다'라고 말한다. 서류 제목·계약 종류도 서류에서 확인되는 사실이다.\n"
+                "2) 찾은 조항, [계산된 사실], [용어 사전]의 조건을 맞춰 보고 결론을 낼 수 있으면 첫 문장에 결론부터 말한다. "
+                "'만약 ~라면' 같은 가정으로 돌려 말하지 마라.\n"
+                "3) 서류만으로 정말 판단할 수 없을 때만 첫 문장을 '이 서류만으로는 알 수 없습니다'로 시작하고, "
+                "무엇을 어디서 확인해야 하는지(예: 업무가 단순노무인지, 청약서, 보험회사) 말한다. 결론을 낸 답에 이 문장을 섞지 마라.\n"
+                "지킬 것: [용어 사전] 설명은 조건(무엇이 1년 이상인지, 몇 개월 이내인지 등)을 바꾸거나 빼지 말고 옮기되, 서류 원문처럼 따옴표로 인용하지 마라. "
+                "용어의 정의는 그 말이 무엇인지만 알려 줄 뿐 이 서류에 해당한다는 뜻이 아니니 일반화해 단정하지 마라. "
+                "근거가 부족하면 추측하지 마라. 사기 여부 판정이나 법률·의료 판단은 하지 말고, 필요하면 전문가 상담을 권하라.")},
+            {"role": "user", "content": f"[용어 사전]\n{ctx}\n\n[계산된 사실]\n{chr(10).join(facts) or '(없음)'}\n\n[서류 내용]\n{doc_text[:12000]}\n\n[질문]\n{question}"},
         ],
     )
     return res.choices[0].message.content
@@ -462,6 +470,14 @@ def main():
 
     finder = (lambda df: find_terms_pdf(data, page_no, df)) if has_text else (lambda df: find_terms(lines, df, fuzzy=True))
     doc_text = "\n".join(t for t, _ in lines)
+    # 챗봇용 글: 글자 정보가 있는 PDF는 모든 쪽을 넘김(보고 있는 쪽을 맨 앞에).
+    # 예) 등기부 2쪽에 있는 근저당도 1쪽을 보면서 물어볼 수 있게. 스캔 PDF·사진은 지금 쪽만.
+    chat_text = doc_text
+    if has_text and src.name.lower().endswith(".pdf"):
+        _pdf = fitz.open(stream=data, filetype="pdf")
+        if _pdf.page_count > 1:
+            order = [page_no] + [i for i in range(_pdf.page_count) if i != page_no]
+            chat_text = "\n\n".join(f"[{i + 1}쪽]\n{_pdf[i].get_text().strip()}" for i in order)
     hits = finder(terms)
 
     # AI로 더 찾기 (버튼을 눌렀을 때만 → API 비용 절약)
@@ -527,7 +543,7 @@ def main():
             st.write(q)
         with st.chat_message("assistant"):
             with st.spinner("답을 찾는 중…"):
-                ans = ai_answer(q, doc_text, ctx_rows, kind, find_periods(doc_text))
+                ans = ai_answer(q, chat_text, ctx_rows, kind, find_periods(chat_text))
             st.write(ans)
             used = refs
             if used:
